@@ -81,13 +81,13 @@ impl PipelineStats {
 ///
 /// Callbacks:
 /// - `on_gpu_progress(d_scanned, gpu_secs, chunk_d_per_sec, candidates_so_far, total_d)`
-/// - `on_gpu_candidates(&[CompactRecord])`: called after each chunk with new records
+/// - `on_gpu_candidates(&[CompactRecord], chunk_start_d, chunk_end_d)`: called after each chunk
 pub fn gpu_scan_ranges(
     gpu: &GpuContext,
     ranges: &[(u64, u64)],
     chunk_size: usize,
     mut on_gpu_progress: impl FnMut(u64, f64, f64, u64, u64),
-    mut on_gpu_candidates: impl FnMut(&[CompactRecord]),
+    mut on_gpu_candidates: impl FnMut(&[CompactRecord], u64, u64),
 ) -> Result<(Vec<CompactRecord>, f64, u64), Box<dyn std::error::Error + Send + Sync>> {
     let total_d: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
     let mut ws = GpuWorkspace::new(gpu, chunk_size)?;
@@ -99,6 +99,8 @@ pub fn gpu_scan_ranges(
         let mut d = range_start;
         while d <= range_end {
             let count = ((range_end - d + 1) as usize).min(chunk_size);
+            let chunk_start = d;
+            let chunk_end = d + count as u64 - 1;
             let t0 = Instant::now();
             kernels::launch_prefilter_and_solve(gpu, &mut ws, d, count)?;
             let (stats, records) = kernels::read_results(&ws)?;
@@ -107,7 +109,7 @@ pub fn gpu_scan_ranges(
             gpu_time += chunk_secs;
             gpu_d += count as u64;
             let new_records = decode_compact_records(&stats, &records);
-            on_gpu_candidates(&new_records);
+            on_gpu_candidates(&new_records, chunk_start, chunk_end);
             all_records.extend(new_records);
             d += count as u64;
             on_gpu_progress(gpu_d, gpu_time, chunk_rate, all_records.len() as u64, total_d);
@@ -182,7 +184,7 @@ pub fn process_records_cpu(
 /// - `on_result`: called for each finalized CycleResult as soon as CPU finishes it
 /// - `on_gpu_progress(d_scanned, gpu_secs, chunk_d_per_sec, candidates_so_far, total_d)`
 /// - `on_gpu_done(d_scanned, gpu_secs, n_candidates)`
-/// - `on_gpu_candidates(&[CompactRecord])`: called after each GPU chunk with new records
+/// - `on_gpu_candidates(&[CompactRecord], chunk_start, chunk_end)`: called after each GPU chunk
 /// - `on_cpu_progress(done, total)`: called periodically during CPU phase
 pub fn search_range_gpu_pipeline(
     gpu: &GpuContext,
@@ -192,7 +194,7 @@ pub fn search_range_gpu_pipeline(
     on_result: impl FnMut(&CycleResult) + Send,
     on_gpu_progress: impl FnMut(u64, f64, f64, u64, u64),
     mut on_gpu_done: impl FnMut(u64, f64, u64),
-    on_gpu_candidates: impl FnMut(&[CompactRecord]),
+    on_gpu_candidates: impl FnMut(&[CompactRecord], u64, u64),
     on_record_done: impl FnMut(&CompactRecord) + Send,
     on_cpu_progress: impl FnMut(u64, u64),
 ) -> Result<PipelineStats, Box<dyn std::error::Error + Send + Sync>> {

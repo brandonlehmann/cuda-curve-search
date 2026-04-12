@@ -482,6 +482,38 @@ fn main() {
             resumed_scanned, resumed_filtered, resumed_processed);
     }
 
+    // Compact GPU file on disk: deduplicate by (discriminant, trace, flags)
+    {
+        let raw: Vec<CompactRecord> = load_jsonl(&paths.gpu);
+        if !raw.is_empty() {
+            let before = raw.len();
+            let mut seen: HashSet<(u64, [u64; 4], u8)> = HashSet::with_capacity(before);
+            let deduped: Vec<CompactRecord> = raw
+                .into_iter()
+                .filter(|rec| {
+                    let flags = (rec.positive_q_passes as u8) | ((rec.negative_q_passes as u8) << 1);
+                    seen.insert((rec.discriminant, rec.trace, flags))
+                })
+                .collect();
+            let after = deduped.len();
+            if after < before {
+                // Atomic rewrite
+                let tmp = format!("{}.tmp", paths.gpu);
+                let mut f = std::fs::File::create(&tmp)
+                    .expect("failed to create gpu tmp file");
+                for rec in &deduped {
+                    if let Ok(line) = serde_json::to_string(rec) {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
+                let _ = f.flush();
+                let _ = fs::rename(&tmp, &paths.gpu);
+                eprintln!("  Compacted GPU file: {} -> {} records ({} duplicates removed)",
+                    before, after, before - after);
+            }
+        }
+    }
+
     // Open output files
     let gpu_file = Mutex::new(open_append(&paths.gpu));
     let scanned_file = Mutex::new(open_append(&paths.scanned));
@@ -569,6 +601,9 @@ fn main() {
                 let gaps = compute_gaps((start_d, end_d), &sorted_scanned);
                 let gap_total: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
 
+                // Collect records from the current GPU scan (empty if nothing to scan)
+                let mut current_run_records: Vec<CompactRecord> = Vec::new();
+
                 if gap_total == 0 {
                     eprintln!("  GPU: all {} D already scanned (resume), skipping GPU phase", total_discriminants);
                 } else {
@@ -612,28 +647,22 @@ fn main() {
                             }
                         },
                         // on_gpu_candidates: write each CompactRecord to GPU file, update checkpoint
-                        |records| {
+                        |records, chunk_start, chunk_end| {
                             for rec in records {
                                 append_jsonl(&gpu_file, rec);
                             }
-                            // Update checkpoint with the range just scanned
-                            // We track progress by noting ranges we've scanned
-                            // The exact sub-range is handled by the chunk boundaries
+                            // Update checkpoint incrementally so crash-resume doesn't
+                            // re-scan (and duplicate) already-written records
+                            let mut cp = checkpoint_mutex.lock().unwrap();
+                            cp.scanned_ranges.push((chunk_start, chunk_end));
+                            merge_ranges(&mut cp.scanned_ranges);
+                            save_checkpoint(&checkpoint_path, &cp);
                         },
                     );
 
                     match scan_result {
-                        Ok((_new_records, gpu_time, gpu_d)) => {
-                            // Update checkpoint with newly scanned gaps
-                            {
-                                let mut cp = checkpoint_mutex.lock().unwrap();
-                                for &gap in &gaps {
-                                    cp.scanned_ranges.push(gap);
-                                }
-                                merge_ranges(&mut cp.scanned_ranges);
-                                save_checkpoint(&checkpoint_path, &cp);
-                            }
-
+                        Ok((new_records, gpu_time, gpu_d)) => {
+                            current_run_records = new_records;
                             let gpu_rate = if gpu_time > 0.0 { gpu_d as f64 / gpu_time } else { 0.0 };
                             let rate_str = if gpu_rate >= 1_000_000.0 {
                                 format!("{:.0}M D/s", gpu_rate / 1_000_000.0)
@@ -641,8 +670,9 @@ fn main() {
                                 format!("{:.0} D/s", gpu_rate)
                             };
                             eprint_flush(&format!(
-                                "  GPU done: {} D in {:.3}s ({})",
+                                "  GPU done: {} D in {:.3}s ({})  candidates: {}",
                                 gpu_d, gpu_time, rate_str,
+                                current_run_records.len(),
                             ));
                         }
                         Err(e) => {
@@ -653,12 +683,29 @@ fn main() {
 
                 // ── CPU phase: process all unprocessed GPU records ──────────
 
-                // Load ALL GPU records (existing + newly scanned)
-                let all_gpu_records: Vec<CompactRecord> = load_jsonl(&paths.gpu);
-                let unprocessed: Vec<CompactRecord> = all_gpu_records
-                    .into_iter()
-                    .filter(|rec| !processed_discriminants.contains(&rec.discriminant))
+                // Build the unprocessed set: current run's records + any old
+                // records from prior runs that never completed CPU processing.
+                // The file on disk contains both old and current-run records,
+                // so we only load old ones that aren't duplicated by current run.
+                let current_run_discriminants: HashSet<u64> = current_run_records
+                    .iter()
+                    .map(|rec| rec.discriminant)
                     .collect();
+                let old_unprocessed: Vec<CompactRecord> = load_jsonl::<CompactRecord>(&paths.gpu)
+                    .into_iter()
+                    .filter(|rec| {
+                        !processed_discriminants.contains(&rec.discriminant)
+                            && !current_run_discriminants.contains(&rec.discriminant)
+                    })
+                    .collect();
+                let n_old = old_unprocessed.len();
+                let n_current = current_run_records.len();
+                let mut unprocessed = current_run_records;
+                unprocessed.extend(old_unprocessed);
+                if n_old > 0 {
+                    eprintln!("  CPU: {} from current scan + {} unprocessed from prior runs",
+                        n_current, n_old);
+                }
 
                 let n_unprocessed = unprocessed.len();
                 if n_unprocessed == 0 {
@@ -673,7 +720,9 @@ fn main() {
                     let last_progress = std::cell::Cell::new(Instant::now());
                     let last_done_count = std::cell::Cell::new(0u64);
                     let last_done_time = std::cell::Cell::new(Instant::now());
-                    let smoothed_rate = std::cell::Cell::new(0.0f64);
+                    // Rate is frozen when no progress is being made (stalled on hard candidate)
+                    let frozen_rate = std::cell::Cell::new(0.0f64);
+                    let wait_start = std::cell::Cell::new(None::<Instant>);
 
                     let (cpu_time, cpu_processed) = gpu::pipeline::process_records_cpu(
                         unprocessed,
@@ -693,29 +742,45 @@ fn main() {
                             let now = Instant::now();
                             if now.duration_since(last_progress.get()).as_secs() >= _progress_interval {
                                 let found = passing_found.load(Ordering::Relaxed);
-                                // Windowed rate: records completed since last report
                                 let prev_done = last_done_count.get();
-                                let dt = now.duration_since(last_done_time.get()).as_secs_f64();
-                                let delta_done = cpu_done - prev_done;
-                                let window_rate = if dt > 0.0 { delta_done as f64 / dt } else { 0.0 };
-                                // Exponential smoothing to avoid jumpy display
-                                let prev_rate = smoothed_rate.get();
-                                let rate = if prev_rate == 0.0 {
-                                    window_rate
+
+                                if cpu_done > prev_done {
+                                    // Progress was made — compute real rate from this window
+                                    let dt = now.duration_since(last_done_time.get()).as_secs_f64();
+                                    let delta = (cpu_done - prev_done) as f64;
+                                    let rate = if dt > 0.0 { delta / dt } else { 0.0 };
+                                    frozen_rate.set(rate);
+                                    last_done_count.set(cpu_done);
+                                    last_done_time.set(now);
+                                    wait_start.set(None);
+
+                                    let remaining = total - cpu_done;
+                                    let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { -1.0 };
+                                    eprint_flush(&format!(
+                                        "  twist: {}/{} done ({:.1} cand/s)  found: {}  ETA: {}  wall: {:.1}s",
+                                        cpu_done, total, rate, found,
+                                        format_duration(eta_secs),
+                                        start.elapsed().as_secs_f64(),
+                                    ));
                                 } else {
-                                    0.3 * window_rate + 0.7 * prev_rate
-                                };
-                                smoothed_rate.set(rate);
-                                last_done_count.set(cpu_done);
-                                last_done_time.set(now);
-                                let remaining = total - cpu_done;
-                                let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { -1.0 };
-                                eprint_flush(&format!(
-                                    "  twist: {}/{} done ({:.1} cand/s)  found: {}  ETA: {}  wall: {:.1}s",
-                                    cpu_done, total, rate, found,
-                                    format_duration(eta_secs),
-                                    start.elapsed().as_secs_f64(),
-                                ));
+                                    // Stalled — show frozen rate and stall duration
+                                    let wait_t = wait_start.get().unwrap_or(now);
+                                    if wait_start.get().is_none() {
+                                        wait_start.set(Some(now));
+                                    }
+                                    let wait_secs = now.duration_since(wait_t).as_secs_f64();
+                                    let rate = frozen_rate.get();
+                                    let remaining = total - cpu_done;
+                                    let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { -1.0 };
+                                    eprint_flush(&format!(
+                                        "  twist: {}/{} done ({:.1} cand/s)  found: {}  ETA: {}  wall: {:.1}s  [waiting {:.0}s]",
+                                        cpu_done, total, rate, found,
+                                        format_duration(eta_secs),
+                                        start.elapsed().as_secs_f64(),
+                                        wait_secs,
+                                    ));
+                                }
+
                                 last_progress.set(now);
                             }
                         },
